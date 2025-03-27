@@ -1,8 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -16,6 +19,78 @@ import (
 	sentrygin "github.com/getsentry/sentry-go/gin"
 )
 
+// requestResponseLogger 记录请求和响应的中间件
+func requestResponseLogger() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// 开始时间
+		startTime := time.Now()
+
+		// 读取请求体
+		var requestBody []byte
+		if c.Request.Body != nil {
+			requestBody, _ = io.ReadAll(c.Request.Body)
+			// 重新设置请求体，因为读取后需要重置
+			c.Request.Body = io.NopCloser(bytes.NewBuffer(requestBody))
+		}
+
+		// 创建一个自定义的响应写入器
+		writer := &responseWriter{
+			ResponseWriter: c.Writer,
+			body:           &bytes.Buffer{},
+		}
+		c.Writer = writer
+
+		// 处理请求
+		c.Next()
+
+		// 计算处理时间
+		duration := time.Since(startTime)
+
+		// 构建日志内容
+		logContent := fmt.Sprintf("HTTP Request/Response - Method: %s, Path: %s, Status: %d, Duration: %s, ClientIP: %s",
+			c.Request.Method,
+			c.Request.URL.Path,
+			c.Writer.Status(),
+			duration.String(),
+			c.ClientIP(),
+		)
+
+		// 添加请求体（如果存在）
+		if len(requestBody) > 0 {
+			var prettyJSON bytes.Buffer
+			if err := json.Indent(&prettyJSON, requestBody, "", "  "); err == nil {
+				logContent += fmt.Sprintf("\nRequest Body:\n%s", prettyJSON.String())
+			} else {
+				logContent += fmt.Sprintf("\nRequest Body:\n%s", string(requestBody))
+			}
+		}
+
+		// 添加响应体（如果存在）
+		if writer.body.Len() > 0 {
+			var prettyJSON bytes.Buffer
+			if err := json.Indent(&prettyJSON, writer.body.Bytes(), "", "  "); err == nil {
+				logContent += fmt.Sprintf("\nResponse Body:\n%s", prettyJSON.String())
+			} else {
+				logContent += fmt.Sprintf("\nResponse Body:\n%s", writer.body.String())
+			}
+		}
+
+		// 记录日志
+		log.Info(logContent)
+	}
+}
+
+// responseWriter 自定义响应写入器
+type responseWriter struct {
+	gin.ResponseWriter
+	body *bytes.Buffer
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	w.body.Write(b)
+	return w.ResponseWriter.Write(b)
+}
+
 // server starts a http server and returns a function to stop it
 func (app *App) server(config *app.Config) func() {
 	engine := gin.New()
@@ -27,6 +102,20 @@ func (app *App) server(config *app.Config) func() {
 		}))
 	}
 	engine.Use(gin.Recovery())
+	engine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
+		return fmt.Sprintf("%s - [%s] \"%s %s %s %d %s \"%s\" %s\"\n",
+			param.ClientIP,
+			param.TimeStamp.Format(time.RFC1123),
+			param.Method,
+			param.Path,
+			param.Request.Proto,
+			param.StatusCode,
+			param.Latency,
+			param.Request.UserAgent(),
+			param.ErrorMessage,
+		)
+	}))
+	engine.Use(requestResponseLogger())
 	engine.GET("/health/check", controllers.HealthCheck(config))
 
 	endpointGroup := engine.Group("/e")
